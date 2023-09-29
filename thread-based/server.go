@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"log"
 	"net"
+	"reflect"
+	"time"
 )
 
 type Server struct {
@@ -18,6 +20,11 @@ type UAPMessage struct {
 	sessionID      uint32
 	data           string
 }
+
+func removeElementFromSlice[T any](slice []T, index int) []T {
+	newSlice := append(slice[:index], slice[index+1:]...)
+	return newSlice
+} //TODO Make a optimized algorithm for index allocation
 
 func NewUAPMessage(command uint8, seqNum, sessionID uint32, data string) *UAPMessage {
 	return &UAPMessage{
@@ -80,39 +87,116 @@ func (s *Server) Start() error {
 }
 
 func handleSession(c chan *UAPMessage) {
-	// timer := time.NewTimer(10 * time.Second)
-	// state := 0
+	defer close(c)
+	timer := time.NewTimer(10 * time.Second)
+	state := 0
+
+	for {
+		select {
+		case <-timer.C:
+			log.Println("Session timeout")
+			c <- nil
+			return
+		case m := <-c:
+			magic := m.magic
+			if magic != 0xC461 {
+				log.Println("Invalid magic number")
+				continue
+			}
+
+			command := m.command
+
+			if state == 0 {
+				if command != 0x00 {
+					log.Println("Invalid command")
+					c <- nil
+					return
+				}
+				log.Println("Session started")
+				state = 1
+			} else if state == 1 {
+				if command == 0x02 {
+					state = 1
+					continue
+				} else if command == 0x01 {
+					data := m.data
+					log.Println(data)
+				} else if command == 0x03 {
+					state = 2
+					c <- nil
+					return
+				} else {
+					log.Println("Invalid command")
+					c <- nil
+					return
+				}
+			}
+			log.Println(m)
+		}
+	}
 
 }
 
-func main() {
+func listenMessages(ch chan *UAPMessage) {
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 8888}
 	udpServer, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer udpServer.Close()
+	for {
+		buf := make([]byte, 1024)
+		n, _, err := udpServer.ReadFromUDP(buf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		receivedMessage := &UAPMessage{}
+		receivedMessage.Decode(buf[:n])
+
+		ch <- receivedMessage
+	}
+}
+
+func main() {
+
+	messageChan := make(chan *UAPMessage)
+
+	cases := []reflect.SelectCase{}
+	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(messageChan)})
+
+	go listenMessages(messageChan)
 
 	m := make(map[uint32]chan *UAPMessage)
 
 	for {
-		buf := make([]byte, 1024)
-		n, _, err := udpServer.ReadFrom(buf)
-		if err != nil {
-			log.Fatal(err)
+		index, value, recvOK := reflect.Select(cases)
+
+		if !recvOK {
+			continue
 		}
 
-		receivedMessage := &UAPMessage{}
-		receivedMessage.Decode(buf[:n])
+		if (reflect.TypeOf(value.Interface()) == reflect.TypeOf(&UAPMessage{})) {
+			receivedMessage := value.Interface().(*UAPMessage)
+			log.Println(receivedMessage)
 
-		c := make(chan *UAPMessage)
+			if _, err := m[receivedMessage.sessionID]; err {
+				c := make(chan *UAPMessage)
+				m[receivedMessage.sessionID] = c
+				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)})
+				go handleSession(c)
+				continue
+			}
+			c := m[receivedMessage.sessionID]
+			c <- receivedMessage
 
-		if _, err := m[receivedMessage.sessionID]; err {
-			c := make(chan *UAPMessage)
-			go handleSession(c)
+			continue
 		}
 
-		c <- receivedMessage
+		delete(m, value.Interface().(uint32))
+		removeElementFromSlice(cases, index) //TODO Improve performance
+
+		// c := make(chan *UAPMessage)
+
 	}
 
 }

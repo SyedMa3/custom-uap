@@ -21,6 +21,11 @@ type UAPMessage struct {
 	data           string
 }
 
+type SendingMessage struct {
+	m    UAPMessage
+	addr *net.UDPAddr
+}
+
 func removeElementFromSlice[T any](slice []T, index int) []T {
 	newSlice := append(slice[:index], slice[index+1:]...)
 	return newSlice
@@ -64,29 +69,7 @@ func NewServer(listenAddr string) *Server {
 	return &Server{listenAddr: listenAddr}
 }
 
-func (s *Server) Start() error {
-	udpServer, err := net.ListenPacket("udp", s.listenAddr)
-	if err != nil {
-		return err
-	}
-	defer udpServer.Close()
-
-	for {
-		buf := make([]byte, 1024)
-		n, addr, err := udpServer.ReadFrom(buf)
-		if err != nil {
-			return err
-		}
-		go func() {
-			_, err = udpServer.WriteTo(buf[:n], addr)
-			if err != nil {
-				log.Fatal(err)
-			}
-		}()
-	}
-}
-
-func handleSession(c chan *UAPMessage) {
+func handleSession(c chan *SendingMessage, sendMessageChan chan *SendingMessage) {
 	defer close(c)
 	timer := time.NewTimer(10 * time.Second)
 	state := 0
@@ -97,7 +80,8 @@ func handleSession(c chan *UAPMessage) {
 			log.Println("Session timeout")
 			c <- nil
 			return
-		case m := <-c:
+		case rm := <-c:
+			m := rm.m
 			magic := m.magic
 			if magic != 0xC461 {
 				log.Println("Invalid magic number")
@@ -114,6 +98,10 @@ func handleSession(c chan *UAPMessage) {
 				}
 				log.Println("Session started")
 				state = 1
+				newM := NewUAPMessage(0x00, 0, m.sessionID, "")
+
+				sendMessageChan <- &SendingMessage{*newM, rm.addr}
+
 			} else if state == 1 {
 				if command == 0x02 {
 					state = 1
@@ -137,36 +125,59 @@ func handleSession(c chan *UAPMessage) {
 
 }
 
-func listenMessages(ch chan *UAPMessage) {
-	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 8888}
-	udpServer, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer udpServer.Close()
+func listenMessages(udpServer *net.UDPConn, ch chan *SendingMessage) {
+	defer close(ch)
 	for {
 		buf := make([]byte, 1024)
-		n, _, err := udpServer.ReadFromUDP(buf)
+		n, addr, err := udpServer.ReadFromUDP(buf)
 		if err != nil {
 			log.Fatal(err)
 		}
 		receivedMessage := &UAPMessage{}
 		receivedMessage.Decode(buf[:n])
 
-		ch <- receivedMessage
+		data := string(buf[12:n])
+
+		if data == "q" {
+			break
+		}
+
+		ch <- &SendingMessage{*receivedMessage, addr}
+	}
+}
+
+func sendMessages(udpServer *net.UDPConn, ch chan *SendingMessage) {
+	seqNum := 0
+	for x := range ch {
+		message := x.m
+		addr := x.addr
+		seqNum++
+
+		_, err := udpServer.WriteToUDP(message.Encode(), addr)
+		if err != nil {
+			continue
+		}
 	}
 }
 
 func main() {
 
-	messageChan := make(chan *UAPMessage)
+	messageChan := make(chan *SendingMessage)
+	sendMessageChan := make(chan *SendingMessage)
 
 	cases := []reflect.SelectCase{}
 	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(messageChan)})
+	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 8888}
+	udpServer, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer udpServer.Close()
+	go listenMessages(udpServer, messageChan)
+	go sendMessages(udpServer, sendMessageChan)
+	defer close(sendMessageChan)
 
-	go listenMessages(messageChan)
-
-	m := make(map[uint32]chan *UAPMessage)
+	m := make(map[uint32]chan *SendingMessage)
 
 	for {
 		index, value, recvOK := reflect.Select(cases)
@@ -175,19 +186,19 @@ func main() {
 			continue
 		}
 
-		if (reflect.TypeOf(value.Interface()) == reflect.TypeOf(&UAPMessage{})) {
-			receivedMessage := value.Interface().(*UAPMessage)
+		if (reflect.TypeOf(value.Interface()) == reflect.TypeOf(&SendingMessage{})) {
+			receievedRM := value.Interface().(*SendingMessage)
+			receivedMessage := receievedRM.m
 			log.Println(receivedMessage)
 
 			if _, err := m[receivedMessage.sessionID]; err {
-				c := make(chan *UAPMessage)
+				c := make(chan *SendingMessage)
 				m[receivedMessage.sessionID] = c
 				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)})
-				go handleSession(c)
-				continue
+				go handleSession(c, sendMessageChan)
 			}
 			c := m[receivedMessage.sessionID]
-			c <- receivedMessage
+			c <- &SendingMessage{receivedMessage, receievedRM.addr}
 
 			continue
 		}

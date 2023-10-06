@@ -91,23 +91,20 @@ session_id = random.randint(0, 2**32 - 1)
 send_message(client_socket, HELLO, session_id)
 
 while True:
-    line = sys.stdin.readline().strip()
-    
-    if not line:
-        break  # End of file
-    
-    
-    
-    with lock:
-        if state == READY:
-            client_socket.settimeout(TIMEOUT)
-            state = READY_TIMER
-        elif state == READY_TIMER:
-            continue
-    # print(line)
-    if line == "q":
+    try:
+        line = input()
+
+        with lock:
+            if state == READY:
+                client_socket.settimeout(TIMEOUT)
+                state = READY_TIMER
+            elif state == READY_TIMER:
+                continue
+        # print(line)
+        if line == "q":
+            break
+        send_message(client_socket, DATA, session_id, line.encode())
+    except EOFError:
         break
-    send_message(client_socket, DATA, session_id, line.encode())
-    
 
 send_message(client_socket, GOODBYE, session_id)

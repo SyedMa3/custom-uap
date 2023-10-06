@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"reflect"
+	"strconv"
 	"time"
 )
 
@@ -181,14 +183,19 @@ func sendMessages(udpServer *net.UDPConn, ch chan *SendingMessage) {
 
 func main() {
 
+	port, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	messageChan := make(chan *SendingMessage)
 	sendMessageChan := make(chan *SendingMessage)
 
 	cases := []reflect.SelectCase{}
 	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(messageChan)})
-	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 8888}
+	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: port}
 	udpServer, err := net.ListenUDP("udp", udpAddr)
-	fmt.Println("Waiting on Port", 8888)
+	fmt.Println("Waiting on Port", port)
 	if err != nil {
 		log.Fatal(err)
 	}

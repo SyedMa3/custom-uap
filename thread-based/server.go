@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"reflect"
@@ -71,34 +72,55 @@ func NewServer(listenAddr string) *Server {
 
 func handleSession(c chan *SendingMessage, sendMessageChan chan *SendingMessage) {
 	defer close(c)
-	timer := time.NewTimer(10 * time.Second)
+	timer := time.NewTimer(60 * time.Second)
 	state := 0
+	var sessionID uint32
+	var addr *net.UDPAddr
+	seqNum := uint32(0)
 
 	for {
 		select {
 		case <-timer.C:
-			log.Println("Session timeout")
-			c <- nil
+			fmt.Println("Session timeout")
+			newM := NewUAPMessage(0x03, 0, sessionID, "")
+			sendMessageChan <- &SendingMessage{*newM, addr}
+			newM2 := NewUAPMessage(0x00, 0, sessionID, "")
+			c <- &SendingMessage{*newM2, nil}
+			fmt.Printf("%v [%v] GOODBYE from client\n", sessionID, seqNum)
 			return
 		case rm := <-c:
 			m := rm.m
+			sessionID = m.sessionID
+			addr = rm.addr
 			magic := m.magic
 			if magic != 0xC461 {
-				log.Println("Invalid magic number")
-				continue
+				fmt.Println("Invalid magic number")
+				newM := NewUAPMessage(0x00, 0, sessionID, "")
+				c <- &SendingMessage{*newM, nil}
+				return
 			}
+			if seqNum-1 == m.sequenceNumber {
+				fmt.Println("duplicate packet")
+				continue
+			} else if m.sequenceNumber > seqNum {
+				for i := seqNum + 1; i < m.sequenceNumber; i++ {
+					fmt.Println("lost packet")
+				}
+			}
+			seqNum = m.sequenceNumber
 
 			command := m.command
 
 			if state == 0 {
 				if command != 0x00 {
-					log.Println("Invalid command")
-					c <- nil
+					fmt.Println("Invalid command")
+					newM := NewUAPMessage(0x00, 0, sessionID, "")
+					c <- &SendingMessage{*newM, nil}
 					return
 				}
-				log.Println("Session started")
+				fmt.Printf("%v [%v] Session Created\n", sessionID, seqNum)
 				state = 1
-				newM := NewUAPMessage(0x00, 0, m.sessionID, "")
+				newM := NewUAPMessage(0x00, 0, sessionID, "")
 
 				sendMessageChan <- &SendingMessage{*newM, rm.addr}
 
@@ -107,19 +129,21 @@ func handleSession(c chan *SendingMessage, sendMessageChan chan *SendingMessage)
 					state = 1
 					continue
 				} else if command == 0x01 {
-					data := m.data
-					log.Println(data)
+					fmt.Printf("%v [%v] %v\n", sessionID, seqNum, m.data)
+					newM := NewUAPMessage(0x02, 0, sessionID, "")
+					sendMessageChan <- &SendingMessage{*newM, rm.addr}
 				} else if command == 0x03 {
 					state = 2
-					c <- nil
+					newM2 := NewUAPMessage(0x00, 0, sessionID, "")
+					c <- &SendingMessage{*newM2, nil}
+					fmt.Printf("%v [%v] GOODBYE from client\n", sessionID, seqNum)
 					return
 				} else {
-					log.Println("Invalid command")
+					fmt.Println("Invalid command")
 					c <- nil
 					return
 				}
 			}
-			log.Println(m)
 		}
 	}
 
@@ -136,12 +160,6 @@ func listenMessages(udpServer *net.UDPConn, ch chan *SendingMessage) {
 		receivedMessage := &UAPMessage{}
 		receivedMessage.Decode(buf[:n])
 
-		data := string(buf[12:n])
-
-		if data == "q" {
-			break
-		}
-
 		ch <- &SendingMessage{*receivedMessage, addr}
 	}
 }
@@ -150,6 +168,7 @@ func sendMessages(udpServer *net.UDPConn, ch chan *SendingMessage) {
 	seqNum := 0
 	for x := range ch {
 		message := x.m
+		message.sequenceNumber = uint32(seqNum)
 		addr := x.addr
 		seqNum++
 
@@ -169,13 +188,14 @@ func main() {
 	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(messageChan)})
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 8888}
 	udpServer, err := net.ListenUDP("udp", udpAddr)
+	fmt.Println("Waiting on Port", 8888)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer udpServer.Close()
 	go listenMessages(udpServer, messageChan)
 	go sendMessages(udpServer, sendMessageChan)
-	defer close(sendMessageChan)
+	// defer close(sendMessageChan)
 
 	m := make(map[uint32]chan *SendingMessage)
 
@@ -188,10 +208,14 @@ func main() {
 
 		if (reflect.TypeOf(value.Interface()) == reflect.TypeOf(&SendingMessage{})) {
 			receievedRM := value.Interface().(*SendingMessage)
+			if receievedRM.addr == nil {
+				delete(m, receievedRM.m.sessionID)
+				removeElementFromSlice(cases, index) //TODO: Improve performance
+				continue
+			}
 			receivedMessage := receievedRM.m
-			log.Println(receivedMessage)
 
-			if _, err := m[receivedMessage.sessionID]; err {
+			if _, ok := m[receivedMessage.sessionID]; !ok {
 				c := make(chan *SendingMessage)
 				m[receivedMessage.sessionID] = c
 				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)})
@@ -202,12 +226,6 @@ func main() {
 
 			continue
 		}
-
-		delete(m, value.Interface().(uint32))
-		removeElementFromSlice(cases, index) //TODO Improve performance
-
-		// c := make(chan *UAPMessage)
-
 	}
 
 }
